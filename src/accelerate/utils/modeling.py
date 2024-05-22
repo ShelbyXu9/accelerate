@@ -381,12 +381,13 @@ def set_module_tensor_to_device(
             device_quantization = device
             device = "cpu"
         # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16)).
-        if is_npu_available() and isinstance(device, int):
-            device = f"npu:{device}"
-        elif is_mlu_available() and isinstance(device, int):
-            device = f"mlu:{device}"
-        if is_xpu_available() and isinstance(device, int):
-            device = f"xpu:{device}"
+        if isinstance(device, int):
+            if is_npu_available():
+                device = f"npu:{device}"
+            elif is_mlu_available():
+                device = f"mlu:{device}"
+            elif is_xpu_available():
+                device = f"xpu:{device}"
         if value is None:
             new_value = old_value.to(device)
             if dtype is not None and device in ["meta", torch.device("meta")]:
@@ -447,14 +448,15 @@ def set_module_tensor_to_device(
                 if not getattr(module.weight, "quant_state", None) and device_index is not None:
                     module.weight = module.weight.cuda(device_index)
     # clean pre and post foward hook
-    if is_npu_available():
-        torch.npu.empty_cache()
-    elif is_mlu_available():
-        torch.mlu.empty_cache()
-    elif is_xpu_available():
-        torch.xpu.empty_cache()
-    else:
-        torch.cuda.empty_cache()
+    if device != "cpu":
+        if is_npu_available():
+            torch.npu.empty_cache()
+        elif is_mlu_available():
+            torch.mlu.empty_cache()
+        elif is_xpu_available():
+            torch.xpu.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
     # When handling tied weights, we update tied_params_map to keep track of the tied weights that have already been allocated on the device in
     # order to avoid duplicating memory, see above.
@@ -801,27 +803,40 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
     import psutil
 
     if max_memory is None:
-        if not (torch.cuda.is_available() or is_npu_available() or is_mlu_available() or is_xpu_available()):
-            max_memory = {}
-
-        else:
-            # Make sure CUDA is initialized on each GPU to have the right memory info.
-            if is_npu_available():
-                for i in range(torch.npu.device_count()):
+        max_memory = {}
+        # Make sure CUDA is initialized on each GPU to have the right memory info.
+        if is_npu_available():
+            for i in range(torch.npu.device_count()):
+                try:
                     _ = torch.tensor(0, device=torch.device("npu", i))
-                max_memory = {i: torch.npu.mem_get_info(i)[0] for i in range(torch.npu.device_count())}
-            elif is_mlu_available():
-                for i in range(torch.mlu.device_count()):
+                    max_memory.append({i: torch.npu.mem_get_info(i)[0]})
+                except Exception:
+                    logger.info(f"Device {i} seems unavailable, Proceeding to check subsequent devices.")
+                    continue
+        elif is_mlu_available():
+            for i in range(torch.mlu.device_count()):
+                try:
                     _ = torch.tensor(0, device=torch.device("mlu", i))
-                max_memory = {i: torch.mlu.mem_get_info(i)[0] for i in range(torch.mlu.device_count())}
-            elif is_xpu_available():
-                for i in range(torch.xpu.device_count()):
+                    max_memory.append({i: torch.mlu.mem_get_info(i)[0]})
+                except Exception:
+                    logger.info(f"Device {i} seems unavailable, Proceeding to check subsequent devices.")
+                    continue
+        elif is_xpu_available():
+            for i in range(torch.xpu.device_count()):
+                try:
                     _ = torch.tensor(0, device=torch.device("xpu", i))
-                max_memory = {i: torch.xpu.max_memory_allocated(i) for i in range(torch.xpu.device_count())}
-            else:
-                for i in range(torch.cuda.device_count()):
+                    max_memory.append({i: torch.xpu.max_memory_allocated(i)})
+                except Exception:
+                    logger.info(f"Device {i} seems unavailable, Proceeding to check subsequent devices.")
+                    continue
+        else:
+            for i in range(torch.cuda.device_count()):
+                try:
                     _ = torch.tensor([0], device=i)
-                max_memory = {i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())}
+                    max_memory.append({i: torch.cuda.mem_get_info(i)[0]})
+                except Exception:
+                    logger.info(f"Device {i} seems unavailable, Proceeding to check subsequent devices.")
+                    continue
         # allocate everything in the mps device as the RAM is shared
         if is_mps_available():
             max_memory["mps"] = psutil.virtual_memory().available
@@ -1783,7 +1798,7 @@ def get_mixed_precision_context_manager(native_amp: bool = False, autocast_kwarg
         )
         if state.mixed_precision == "fp16":
             return torch.autocast(device_type=device_type, dtype=torch.float16, **autocast_kwargs)
-        elif state.mixed_precision == "bf16" and state.distributed_type in [
+        elif state.mixed_precision in ["bf16", "fp8"] and state.distributed_type in [
             DistributedType.NO,
             DistributedType.MULTI_CPU,
             DistributedType.MULTI_GPU,

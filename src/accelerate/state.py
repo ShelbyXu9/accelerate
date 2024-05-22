@@ -179,22 +179,14 @@ class PartialState:
                 )
 
             # Sets up self.backend + imports
-            backend, distributed_type = self._prepare_backend(cpu, use_sagemaker_dp, kwargs.pop("backend", None))
+            original_backend = kwargs.pop("backend", None)
+            backend, distributed_type = self._prepare_backend(cpu, use_sagemaker_dp, original_backend)
+            if original_backend is not None and backend != original_backend:
+                raise ValueError("Your assigned backend {original_backend} is not avaliable, please use {backend}")
             self.backend = backend
             self.distributed_type = distributed_type
             use_deepspeed = False
-            if not cpu:
-                # Deal with XLA
-                if is_torch_xla_available():
-                    self.device = xm.xla_device()
-                    xm.set_replication(self.device, xm.get_xla_supported_devices())
-                    self.num_processes = xm.xrt_world_size()
-                    self.process_index = xm.get_ordinal()
-                    if is_torch_xla_available(check_is_tpu=True):
-                        self.local_process_index = xm.get_local_ordinal()
-                    else:
-                        self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
-                    self.distributed_type = DistributedType.XLA
+            if not cpu and self.backend != "xla":
                 if int(os.environ.get("LOCAL_RANK", -1)) != -1:
                     # Deal with spawning deepspeed
                     if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true":
@@ -204,7 +196,7 @@ class PartialState:
                             )
                         from deepspeed import comm as dist
 
-                        if is_xpu_available and is_ccl_available():
+                        if is_xpu_available() and is_ccl_available():
                             os.environ["CCL_PROCESS_LAUNCHER"] = "none"
                             os.environ["CCL_LOCAL_SIZE"] = os.environ.get("LOCAL_WORLD_SIZE", "1")
                             os.environ["CCL_LOCAL_RANK"] = os.environ.get("LOCAL_RANK", "0")
@@ -270,6 +262,16 @@ class PartialState:
                 self.num_processes = 1
                 self.process_index = 0
                 self.local_process_index = 0
+            elif self.backend == "xla":
+                # XLA needs device setting first for `set_replication`
+                self.set_device()
+                xm.set_replication(self.device, xm.get_xla_supported_devices())
+                self.num_processes = xm.xrt_world_size()
+                self.process_index = xm.get_ordinal()
+                if is_torch_xla_available(check_is_tpu=True):
+                    self.local_process_index = xm.get_local_ordinal()
+                else:
+                    self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
             else:
                 self.num_processes = torch.distributed.get_world_size()
                 self.process_index = torch.distributed.get_rank()
@@ -284,16 +286,17 @@ class PartialState:
             # Set CPU affinity if enabled
             if parse_flag_from_env("ACCELERATE_CPU_AFFINITY", False):
                 set_numa_affinity(self.local_process_index)
-        self.fork_launched = parse_flag_from_env("FORK_LAUNCHED", 0)
 
-        # Check for old RTX 4000's that can't use P2P or IB and are on old drivers
-        if self.device.type == "cuda" and not check_cuda_p2p_ib_support():
-            if "NCCL_P2P_DISABLE" not in os.environ or "NCCL_IB_DISABLE" not in os.environ:
-                raise NotImplementedError(
-                    "Using RTX 4000 series doesn't support faster communication broadband via P2P or IB. "
-                    'Please set `NCCL_P2P_DISABLE="1"` and `NCCL_IB_DISABLE="1" or use `accelerate launch` which '
-                    "will do this automatically."
-                )
+            # Check for old RTX 4000's that can't use P2P or IB and are on old drivers
+            if self.device.type == "cuda" and not check_cuda_p2p_ib_support():
+                if "NCCL_P2P_DISABLE" not in os.environ or "NCCL_IB_DISABLE" not in os.environ:
+                    raise NotImplementedError(
+                        "Using RTX 4000 series doesn't support faster communication broadband via P2P or IB. "
+                        'Please set `NCCL_P2P_DISABLE="1"` and `NCCL_IB_DISABLE="1" or use `accelerate launch` which '
+                        "will do this automatically."
+                    )
+        # Important: This should be the *only* code outside of `self.initialized!`
+        self.fork_launched = parse_flag_from_env("FORK_LAUNCHED", 0)
 
     def __repr__(self) -> str:
         return (
@@ -715,19 +718,22 @@ class PartialState:
 
             backend = "smddp"
             distributed_type = DistributedType.MULTI_GPU
-        elif int(os.environ.get("LOCAL_RANK", -1)) != -1:
-            if not cpu:
-                if is_mlu_available():
-                    backend = "cncl"
-                    distributed_type = DistributedType.MULTI_MLU
-                elif torch.cuda.is_available():
-                    if backend is None:
-                        backend = "nccl"
-                    distributed_type = DistributedType.MULTI_GPU
-                elif is_npu_available():
-                    backend = "hccl"
-                    distributed_type = DistributedType.MULTI_NPU
-        if backend is None and (
+        elif is_torch_xla_available():
+            backend = "xla"
+            distributed_type = DistributedType.XLA
+        elif int(os.environ.get("LOCAL_RANK", -1)) != -1 and not cpu:
+            if is_mlu_available():
+                backend = "cncl"
+                distributed_type = DistributedType.MULTI_MLU
+            elif torch.cuda.is_available():
+                if backend is None:
+                    backend = "nccl"
+                distributed_type = DistributedType.MULTI_GPU
+            elif is_npu_available():
+                backend = "hccl"
+                distributed_type = DistributedType.MULTI_NPU
+
+        if distributed_type is None and (
             int(os.environ.get("LOCAL_RANK", -1)) != -1
             or get_int_from_env(["PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE", "WORLD_SIZE"], 1) > 1
         ):
@@ -735,8 +741,11 @@ class PartialState:
                 distributed_type = DistributedType.MULTI_XPU
             else:
                 distributed_type = DistributedType.MULTI_CPU
-            if is_ccl_available() and (
-                get_int_from_env(["CCL_WORKER_COUNT"], 0) > 0 or distributed_type == DistributedType.MULTI_XPU
+
+            if (
+                backend in (None, "ccl")
+                and is_ccl_available()
+                and (get_int_from_env(["CCL_WORKER_COUNT"], 0) > 0 or distributed_type == DistributedType.MULTI_XPU)
             ):
                 if get_ccl_version() >= "1.12":
                     import oneccl_bindings_for_pytorch  # noqa: F401
@@ -744,12 +753,13 @@ class PartialState:
                     import torch_ccl  # noqa: F401
 
                 backend = "ccl"
-            elif torch.distributed.is_mpi_available():
+            elif backend in (None, "mpi") and torch.distributed.is_mpi_available():
                 backend = "mpi"
             else:
                 backend = "gloo"
         if distributed_type is None:
             distributed_type = DistributedType.NO
+
         return backend, distributed_type
 
     def set_device(self):
@@ -758,17 +768,20 @@ class PartialState:
         """
         if self.device is not None:
             return
-        if self.num_processes == 1:
+        if self.distributed_type == DistributedType.NO:
             self.device = torch.device("cpu") if self._cpu else self.default_device
             return
         device = str(self.distributed_type).split(".")[-1].replace("MULTI_", "").lower()
-        if device not in ("cpu", "gpu", "mlu", "npu", "xpu"):
+        if device not in ("cpu", "gpu", "mlu", "npu", "xpu", "xla"):
             raise ValueError(
                 f"Can't set device for {self.distributed_type} ({device}), verify we should be calling `_set_device()` for it!"
             )
-        if device == "gpu":
-            device = "cuda"
-        self.device = torch.device(device, self.local_process_index)
+        if device == "xla":
+            self.device = xm.xla_device()
+        else:
+            if device == "gpu":
+                device = "cuda"
+            self.device = torch.device(device, self.local_process_index)
         if self.device is not None:
             if device == "xpu":
                 torch.xpu.set_device(self.device)
@@ -893,7 +906,6 @@ class AcceleratorState:
                         fsdp_plugin.set_mixed_precision(self._mixed_precision)
                     self.fsdp_plugin = fsdp_plugin
                 if os.environ.get("ACCELERATE_USE_MEGATRON_LM", "false") == "true" and self.distributed_type not in [
-                    DistributedType.MULTI_NPU,
                     DistributedType.MULTI_XPU,
                 ]:
                     self.distributed_type = DistributedType.MEGATRON_LM
